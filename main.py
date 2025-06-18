@@ -1,51 +1,60 @@
+import subprocess
+import sys
+
+# Automatically install missing dependencies on startup
+SUBPROCESS_ARGS = [sys.executable, "-m", "pip", "install"]
+REQUIRED_PACKAGES = [
+    "fastapi",
+    "uvicorn[standard]",
+    "numpy",
+    "httpx",
+    "python-dotenv",
+    "google-generativeai",
+    "Pillow",
+    "scikit-learn"
+]
+
+subprocess.run(SUBPROCESS_ARGS + REQUIRED_PACKAGES, check=True)
+
+
+import os
+import sys
+import time
+import json
 import asyncio
 import base64
-import json
+import tempfile
 import numpy as np
-import os
-import time
 import httpx
+
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from utils.auth import verify_api_key
-from utils.rate_limiter import RateLimiter
-from utils.logging_config import setup_logging, get_logger
-import tempfile
 from contextlib import asynccontextmanager
+
+# Utility imports (assumes utils package is present)
+from utils.auth import verify_api_key      # API key validation
+from utils.rate_limiter import RateLimiter # Rate limiting per IP
+from utils.logging_config import setup_logging, get_logger
 
 # Initialize logging
 setup_logging()
 logger = get_logger(__name__)
 
-app = FastAPI(
-    title="TDS Virtual TA API",
-    description="RAG-powered Q&A system for data science course",
-    version="1.0.0"
-)
-
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Configuration
-EMBEDDING_MODEL = "text-embedding-3-small"
-LLM_MODEL = "gpt-4o-mini"
-AIPROXY_BASE_URL = "https://aiproxy.sanand.workers.dev"
+# Constants and configuration
+AIPROXY_URL     = "https://aiproxy.sanand.workers.dev"
 EMBEDDINGS_FILE = "knowledge_embeddings.npz"
+EMBEDDING_MODEL = "text-embedding-3-small"
+LLM_MODEL       = "gpt-4o-mini"
 
-# Rate limiter
+# Rate limiter (60 requests/minute per client IP)
 rate_limiter = RateLimiter(max_requests=60, time_window=60)
 
+# Pydantic models
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=5, max_length=1000)
-    image: Optional[str] = Field(None, description="Base64 encoded image")
+    image: Optional[str]
 
 class ReferenceLink(BaseModel):
     url: str
@@ -54,294 +63,160 @@ class ReferenceLink(BaseModel):
 class APIResponse(BaseModel):
     answer: str
     links: List[ReferenceLink]
-    confidence: Optional[float] = None
-    processing_time: Optional[float] = None
+    confidence: float
+    processing_time: float
 
 class HealthResponse(BaseModel):
     status: str
     embeddings_loaded: bool
     total_chunks: int
 
-# Global variables for embeddings
-embeddings_data = None
-
-@app.on_event("startup")
-async def load_embeddings():
-    """Load precomputed embeddings and metadata on startup"""
-    global embeddings_data
+# Lifespan: load embeddings once on startup, clear on shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     try:
-        if not os.path.exists(EMBEDDINGS_FILE):
-            raise FileNotFoundError(f"Embeddings file {EMBEDDINGS_FILE} not found")
-        
         data = np.load(EMBEDDINGS_FILE, allow_pickle=True)
-        embeddings_data = {
+        app.state.embeddings_data = {
             "chunks": data["chunks"],
             "embeddings": data["embeddings"].astype(np.float32),
-            "metadata": json.loads(data["metadata"].item()) if isinstance(data["metadata"].item(), str) else data["metadata"].item()
+            "metadata": json.loads(data["metadata"].item())
         }
-        logger.info(f"Loaded {len(embeddings_data['chunks'])} chunks and embeddings")
+        logger.info(f"Loaded {len(app.state.embeddings_data['chunks'])} chunks") 
     except Exception as e:
-        logger.error(f"Failed to load embeddings: {e}")
-        raise
+        logger.error(f"Failed to load embeddings: {e}") 
+        app.state.embeddings_data = None
+    yield
+    app.state.embeddings_data = None
+    logger.info("Cleaned up embeddings") 
+
+# Create FastAPI app with lifespan handler
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
 
 async def get_embedding(text: str) -> List[float]:
-    """Get embedding using AI Proxy with retry logic"""
-    max_retries = 3
-    for attempt in range(max_retries):
+    """Generate text embeddings via AI Proxy with retry logic."""
+    headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+    payload = {"model": EMBEDDING_MODEL, "input": text}
+    for i in range(3):
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    f"{AIPROXY_BASE_URL}/openai/v1/embeddings",
-                    headers={
-                        "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": EMBEDDING_MODEL,
-                        "input": text
-                    }
-                )
-                response.raise_for_status()
-                return response.json()["data"][0]["embedding"]
+                r = await client.post(f"{AIPROXY_URL}/openai/v1/embeddings",
+                                      headers=headers, json=payload)
+                r.raise_for_status()
+                return r.json()["data"][0]["embedding"]
         except Exception as e:
-            logger.warning(f"Embedding attempt {attempt + 1} failed: {e}")
-            if attempt == max_retries - 1:
-                raise HTTPException(status_code=503, detail="Failed to generate embedding")
-            await asyncio.sleep(2 ** attempt)
+            logger.warning(f"Embedding attempt {i+1} failed: {e}") 
+            await asyncio.sleep(2**i)
+    raise HTTPException(status_code=503, detail="Embedding service unavailable") 
 
-async def analyze_image_with_gemini(image_b64: str) -> str:
-    """Analyze image using Google Gemini API"""
+async def analyze_image(image_b64: str) -> str:
+    """Use Google Gemini to generate concise image descriptions."""
     try:
-        # Decode base64 image
-        image_data = base64.b64decode(image_b64)
-        
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
-            tmp_file.write(image_data)
-            tmp_file_path = tmp_file.name
-        
+        from google import generativeai as genai
+        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+        model = genai.GenerativeModel("gemini-1.5-flash-latest")
+
+        img_data = base64.b64decode(image_b64)
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp.write(img_data)
+            path = tmp.name
+
         try:
-            # Initialize Gemini client
-            import google.generativeai as genai
-            genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-            model = genai.GenerativeModel('gemini-2.0-flash')
-            
-            # Upload and analyze image
-            uploaded_file = genai.upload_file(tmp_file_path)
-            
-            prompt = """Analyze this technical image and provide a concise description (2-3 sentences max) focusing on:
-1. Visible code snippets/error messages (transcribe exactly)
-2. UI elements relevant to technical problems
-3. Data visualizations/charts
-4. Key textual content related to technical issues
-Omit decorative elements and focus on actionable technical details."""
-            
-            response = model.generate_content([uploaded_file, prompt])
-            return response.text.strip()
-            
+            uploaded = model.upload_file(path)
+            prompt = ("Provide a concise 1–2 sentence technical summary: "
+                      "transcribe code/errors, note key UI elements, omit decoration.")
+            resp = model.generate_content([uploaded, prompt])
+            return resp.text.strip()
         finally:
-            # Clean up temporary file
-            os.unlink(tmp_file_path)
-            
+            os.unlink(path)
     except Exception as e:
-        logger.error(f"Image analysis failed: {e}")
-        return "Unable to analyze the provided image"
+        logger.error(f"Image analysis failed: {e}") 
+        return "Image description unavailable" 
 
 async def generate_answer(context: str, question: str) -> str:
-    """Generate answer using GPT-4o-mini via AI Proxy"""
-    system_prompt = """You are an expert teaching assistant for a data science course. Use ONLY the provided context to answer questions accurately and concisely.
-
-FORMATTING RULES:
-- Use **bold** for key terms and concepts
-- Format code blocks with triple backticks and language specification
-- Use bullet points for multi-step explanations
-- Include relevant examples when available in context
-
-CONTENT RULES:
-- Answer directly and concisely
-- Always reference specific course materials or discussions when applicable
-- For code questions, provide exact syntax and examples
-- If multiple approaches exist, mention the recommended one first
-- For unclear questions, ask for clarification
-
-CITATION RULES:
-- Never mention "context" or "provided information" directly
-- If information is insufficient, state: "This specific information is not covered in the available course materials"
-- Focus on practical, actionable guidance
-
-EXAMPLE RESPONSE:
-For model selection in assignments, use **gpt-3.5-turbo-0125** as specified in the course requirements.
-
-
-**Key considerations:**
-- Cost efficiency for assignments
-- Consistent results across students
-- API availability and rate limits"""
-    
-    max_retries = 3
-    for attempt in range(max_retries):
+    """Generate an LLM answer using GPT-4o-mini via AI Proxy."""
+    system_prompt = (
+        "You are a data science TA. Answer ONLY from the context. "
+        "Be concise, format code with triple backticks, bold key terms. "
+        "If insufficient info, reply 'The provided materials do not contain enough information.'"
+    )
+    headers = {"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"}
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}
+        ],
+        "temperature": 0.1,
+        "max_tokens": 800
+    }
+    for i in range(3):
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
-                response = await client.post(
-                    f"{AIPROXY_BASE_URL}/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": LLM_MODEL,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}
-                        ],
-                        "temperature": 0.2,
-                        "max_tokens": 800,
-                        "top_p": 0.9
-                    }
-                )
-                response.raise_for_status()
-                return response.json()["choices"][0]["message"]["content"]
+                r = await client.post(f"{AIPROXY_URL}/openai/v1/chat/completions",
+                                      headers=headers, json=payload)
+                r.raise_for_status()
+                return r.json()["choices"][0]["message"]["content"]
         except Exception as e:
-            logger.warning(f"LLM attempt {attempt + 1} failed: {e}")
-            if attempt == max_retries - 1:
-                raise HTTPException(status_code=503, detail="Failed to generate answer")
-            await asyncio.sleep(2 ** attempt)
+            logger.warning(f"LLM attempt {i+1} failed: {e}") 
+            await asyncio.sleep(2**i)
+    raise HTTPException(status_code=503, detail="Answer generation failed") 
 
-def extract_references(top_indices: List[int], similarities: np.ndarray) -> List[ReferenceLink]:
-    """Extract reference links with relevance-based text"""
-    references = []
-    seen_urls = set()
-    
-    for i, idx in enumerate(top_indices):
-        if i >= 3:  # Limit to top 3 references
+def extract_references(indices: List[int], sims: np.ndarray) -> List[ReferenceLink]:
+    """Extract up to 5 unique reference links from metadata."""
+    refs, seen = [], set()
+    ed = app.state.embeddings_data
+    for idx in indices:
+        meta = ed["metadata"][idx]
+        url = meta.get("topic_url") or meta.get("original_url")
+        snippet = ed["chunks"][idx][:150].replace("\n", " ").strip() + "..."
+        if url and url not in seen and sims[idx] >= 0.3:
+            seen.add(url)
+            refs.append(ReferenceLink(url=url, text=snippet))
+        if len(refs) >= 5:
             break
-            
-        meta = embeddings_data["metadata"][idx]
-        chunk_text = embeddings_data["chunks"][idx]
-        similarity_score = similarities[idx]
-        
-        # Skip low-relevance chunks
-        if similarity_score < 0.3:
-            continue
-            
-        urls_to_process = []
-        
-        if meta.get("source_type") == "discourse":
-            if meta.get("topic_url"):
-                urls_to_process.append(("topic", meta["topic_url"]))
-            for post_url in meta.get("post_urls", []):
-                urls_to_process.append(("post", post_url))
-        elif meta.get("source_type") == "tds_course":
-            if meta.get("original_url"):
-                urls_to_process.append(("course", meta["original_url"]))
-        
-        for url_type, url in urls_to_process:
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                
-                # Extract meaningful text snippet
-                text_snippet = chunk_text[:200].strip()
-                if len(chunk_text) > 200:
-                    text_snippet += "..."
-                
-                # Clean up text snippet
-                text_snippet = text_snippet.replace('\n', ' ').replace('  ', ' ')
-                
-                references.append(ReferenceLink(
-                    url=url,
-                    text=text_snippet
-                ))
-    
-    return references
+    return refs 
 
 @app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint"""
-    return HealthResponse(
-        status="healthy",
-        embeddings_loaded=embeddings_data is not None,
-        total_chunks=len(embeddings_data["chunks"]) if embeddings_data else 0
-    )
+async def health():
+    """Service health check."""
+    ed = app.state.embeddings_data
+    loaded = ed is not None
+    count  = len(ed["chunks"]) if loaded else 0
+    return HealthResponse(status="healthy", embeddings_loaded=loaded, total_chunks=count) 
 
-@app.post("/api/", response_model=APIResponse)
-async def answer_question(
-    request: QueryRequest,
-    http_request: Request,
-    _: str = Depends(verify_api_key)
-):
-    """Main API endpoint for answering questions"""
-    start_time = time.time()
-    
-    try:
-        # Rate limiting
-        client_ip = http_request.client.host
-        await rate_limiter.check_rate_limit(client_ip)
-        
-        logger.info(f"Processing question: {request.question[:100]}...")
-        
-        # Check if embeddings are loaded
-        if embeddings_data is None:
-            raise HTTPException(status_code=503, detail="Embeddings not loaded")
-        
-        # Process image if provided
-        enhanced_question = request.question
-        if request.image:
-            logger.info("Analyzing provided image")
-            image_description = await analyze_image_with_gemini(request.image)
-            enhanced_question = f"{request.question}\n\nImage content: {image_description}"
-        
-        # Get question embedding
-        question_embed = await get_embedding(enhanced_question)
-        
-        # Calculate cosine similarities
-        question_norm = np.linalg.norm(question_embed)
-        chunk_norms = np.linalg.norm(embeddings_data["embeddings"], axis=1)
-        
-        similarities = np.dot(embeddings_data["embeddings"], question_embed) / (chunk_norms * question_norm)
-        
-        # Get top 5 most similar chunks
-        top_indices = np.argsort(similarities)[-5:][::-1]
-        top_similarities = similarities[top_indices]
-        
-        # Build context from top chunks
-        context_chunks = []
-        for i, idx in enumerate(top_indices):
-            chunk = embeddings_data["chunks"][idx]
-            score = top_similarities[i]
-            context_chunks.append(f"[Source {i+1}] (Relevance: {score:.2f})\n{chunk}")
-        
-        context = "\n\n---\n\n".join(context_chunks)
-        
-        # Generate answer
-        answer = await generate_answer(context, request.question)
-        
-        # Extract references
-        references = extract_references(top_indices, similarities)
-        
-        processing_time = time.time() - start_time
-        confidence = float(np.mean(top_similarities))
-        
-        logger.info(f"Question answered in {processing_time:.2f}s with confidence {confidence:.2f}")
-        
-        return APIResponse(
-            answer=answer,
-            links=references,
-            confidence=confidence,
-            processing_time=processing_time
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+@app.post("/api/", response_model=APIResponse, dependencies=[Depends(verify_api_key)])
+async def answer_question(request: QueryRequest, req: Request):
+    """Main Q&A endpoint combining image and text retrieval."""
+    start = time.time()
+    await rate_limiter.check_rate_limit(req.client.host)
 
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    """Custom HTTP exception handler"""
-    logger.error(f"HTTP {exc.status_code}: {exc.detail}")
-    return {"error": exc.detail, "status_code": exc.status_code}
+    ed = app.state.embeddings_data
+    if not ed:
+        raise HTTPException(status_code=503, detail="Embeddings not loaded")
+
+    q = request.question
+    if request.image:
+        desc = await analyze_image(request.image)
+        q += "\n\nImage: " + desc
+
+    emb = await get_embedding(q)
+    embs = ed["embeddings"]
+    sims = (embs @ emb) / (np.linalg.norm(embs,axis=1)*np.linalg.norm(emb))
+    top = np.argsort(sims)[-5:][::-1]
+    context = "\n\n---\n\n".join(ed["chunks"][i] for i in top)
+
+    answer = await generate_answer(context, request.question)
+    links  = extract_references(top, sims)
+    duration = time.time() - start
+    conf = float(np.mean(sims[top]))
+
+    logger.info(f"Answered in {duration:.2f}s with confidence {conf:.2f}") 
+    return APIResponse(answer=answer, links=links, confidence=conf, processing_time=duration) 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
