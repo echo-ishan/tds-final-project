@@ -1,0 +1,26 @@
+beautifulsoup4
+markdownify
+playwright
+requests
+rich
+openai
+python-dotenv
+google-generativeai
+Pillow
+tqdm
+scikit-learn
+pydantic
+fastapi
+uvicorn
+httpx
+python-dotenv
+#utils
+#aiohttp
+numpy
+# pydantic
+beautifulsoup4
+# html2text
+# tqdm
+# markdown
+# python-multipart
+# setuptools
