@@ -1,9 +1,9 @@
-beautifulsoup4
-markdownify
-playwright
+# beautifulsoup4
+# markdownify
+# playwright
 requests
 rich
-openai
+# openai
 python-dotenv
 google-generativeai
 Pillow
